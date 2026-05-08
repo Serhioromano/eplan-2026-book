@@ -5,10 +5,13 @@
 Не требует внешних зависимостей кроме numpy и sqlite3 (stdlib).
 
 Использование:
-    python3 search_engine.py index          # построить индекс
-    python3 search_engine.py "клеммная колодка"   # поиск
-    python3 search_engine.py "макрос" --top 10    # топ-10 результатов
-    python3 search_engine.py --stats               # статистика индекса
+    python3 search_engine.py index                     # построить индекс
+    python3 search_engine.py "клеммная колодка"         # поиск
+    python3 search_engine.py "макрос" --top 10          # топ-10
+    python3 search_engine.py "запрос1" "запрос2" ...    # мультипоиск с дедупликацией
+    python3 search_engine.py "запрос" --paths-only      # только пути к файлам
+    python3 search_engine.py "клемма" --min-score 0.35  # отсечь шум
+    python3 search_engine.py --stats                    # статистика
 """
 
 import sqlite3
@@ -178,6 +181,25 @@ class SearchEngine:
         words = re.findall(r"[а-яёa-z0-9]+", text.lower())
         return [w for w in words if w not in self.stopwords and len(w) > 1]
 
+    def multi_search(self, queries: list[str], top: int = 10) -> list[SearchResult]:
+        """Поиск по нескольким запросам с дедупликацией по path.
+        Для каждого path сохраняется результат с наивысшим score."""
+        if not queries:
+            return []
+        if len(queries) == 1:
+            return self.search(queries[0], top=top)
+
+        # Собираем результаты всех запросов
+        all_results: dict[str, SearchResult] = {}
+        for q in queries:
+            for r in self.search(q, top=top * 2):  # с запасом для объединения
+                if r.path not in all_results or r.score > all_results[r.path].score:
+                    all_results[r.path] = r
+
+        # Сортируем по score и берём top
+        merged = sorted(all_results.values(), key=lambda x: x.score, reverse=True)
+        return merged[:top]
+
     def search(self, query: str, top: int = 10) -> list[SearchResult]:
         """Гибридный поиск: FTS5 + TF-IDF переранжирование."""
         if not self.db_path.exists():
@@ -190,6 +212,9 @@ class SearchEngine:
 
         # 1. FTS5 поиск (оригинальные токены, НЕ стеммированные)
         raw_tokens = self._raw_tokens(query)
+        if not raw_tokens:
+            conn.close()
+            return []
         # Используем префиксный поиск: "клемм"* найдёт "клеммных", "клеммы" и т.д.
         fts_query = " OR ".join(f'"{t}"*' for t in raw_tokens)
 
@@ -332,28 +357,43 @@ class SearchEngine:
 
 # === CLI =====================================================================
 
-def _parse_args(args: list[str]) -> tuple[str, int, bool]:
-    """Разбор аргументов: (query, top, use_json)."""
-    query_parts = []
+def _parse_args(args: list[str]) -> tuple[list[str], int, float, bool, bool]:
+    """Разбор аргументов: (queries, top, min_score, use_json, paths_only).
+    Каждый не-флаговый аргумент — отдельный поисковый запрос."""
+    queries: list[str] = []
     top = 10
+    min_score = 0.0
     use_json = False
+    paths_only = False
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--top" and i + 1 < len(args):
             top = int(args[i + 1])
             i += 2
+        elif a == "--min-score" and i + 1 < len(args):
+            min_score = float(args[i + 1])
+            i += 2
         elif a == "--json":
             use_json = True
             i += 1
-        else:
-            query_parts.append(a)
+        elif a == "--paths-only":
+            paths_only = True
             i += 1
-    return " ".join(query_parts), top, use_json
+        else:
+            queries.append(a)
+            i += 1
+    return queries, top, min_score, use_json, paths_only
 
 
-def _output(results: list, use_json: bool):
-    """Вывод результатов: текст или JSON."""
+def _output(results: list, min_score: float, use_json: bool, paths_only: bool):
+    """Вывод результатов."""
+    if min_score > 0:
+        results = [r for r in results if r.score >= min_score]
+    if paths_only:
+        for r in results:
+            print(r.path)
+        return
     if use_json:
         out = [
             {
@@ -398,15 +438,15 @@ if __name__ == "__main__":
         print(json.dumps(s, indent=2, ensure_ascii=False))
 
     elif cmd in ("search", "s"):
-        query, top, use_json = _parse_args(sys.argv[2:])
-        if not query:
+        queries, top, min_score, use_json, paths_only = _parse_args(sys.argv[2:])
+        if not queries:
             print("Укажите поисковый запрос")
             sys.exit(1)
-        results = engine.search(query, top=top)
-        _output(results, use_json)
+        results = engine.multi_search(queries, top=top)
+        _output(results, min_score, use_json, paths_only)
 
     else:
-        # Поиск по умолчанию (первый аргумент — запрос)
-        query, top, use_json = _parse_args(sys.argv[1:])
-        results = engine.search(query, top=top)
-        _output(results, use_json)
+        # Поиск по умолчанию (аргументы — запросы)
+        queries, top, min_score, use_json, paths_only = _parse_args(sys.argv[1:])
+        results = engine.multi_search(queries, top=top)
+        _output(results, min_score, use_json, paths_only)
